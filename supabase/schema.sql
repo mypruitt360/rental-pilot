@@ -1,0 +1,12 @@
+create extension if not exists "pgcrypto";
+create table properties (id uuid primary key default gen_random_uuid(), owner_id uuid not null references auth.users(id), name text not null, address text, capacity int default 0, created_at timestamptz default now());
+create table billing_contacts (id uuid primary key default gen_random_uuid(), owner_id uuid not null references auth.users(id), name text not null, relationship text, email text, phone text, created_at timestamptz default now());
+create table residents (id uuid primary key default gen_random_uuid(), owner_id uuid not null references auth.users(id), property_id uuid references properties(id), billing_contact_id uuid references billing_contacts(id), name text not null, email text, phone text, monthly_rent numeric(12,2) not null default 0, due_day int not null default 1, active boolean default true, created_at timestamptz default now());
+create table payments (id uuid primary key default gen_random_uuid(), owner_id uuid not null references auth.users(id), resident_id uuid references residents(id), amount numeric(12,2) not null, paid_on date not null, method text, notes text, created_at timestamptz default now());
+create table expenses (id uuid primary key default gen_random_uuid(), owner_id uuid not null references auth.users(id), property_id uuid references properties(id), amount numeric(12,2) not null, category text, vendor text, incurred_on date not null, notes text, created_at timestamptz default now());
+alter table properties enable row level security; alter table billing_contacts enable row level security; alter table residents enable row level security; alter table payments enable row level security; alter table expenses enable row level security;
+create policy "owner properties" on properties for all using (auth.uid()=owner_id) with check (auth.uid()=owner_id);
+create policy "owner billing contacts" on billing_contacts for all using (auth.uid()=owner_id) with check (auth.uid()=owner_id);
+create policy "owner residents" on residents for all using (auth.uid()=owner_id) with check (auth.uid()=owner_id);
+create policy "owner payments" on payments for all using (auth.uid()=owner_id) with check (auth.uid()=owner_id);
+create policy "owner expenses" on expenses for all using (auth.uid()=owner_id) with check (auth.uid()=owner_id);
