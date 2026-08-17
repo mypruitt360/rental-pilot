@@ -875,109 +875,30 @@ export default function App(){
     saveDocuments(documents.filter(d=>d.id!==id));
   };
 
-  const upsertPayment = async payment => {
+  const upsertPayment = payment => {
     const paymentMonth=payment.month||month;
     const next={id:`pay-${Date.now()}`,...payment,month:paymentMonth};
+    savePayments([...payments,next]);
 
-    if(!session?.user?.id){
-      alert('Please sign in before recording a payment.');
-      return;
-    }
-
-    const resident=residents.find(r=>r.id===next.residentId);
-    if(!resident){
-      alert('Could not find that resident.');
-      return;
-    }
-
-    try{
-      let residentCloudId=resident.cloudId||null;
-
-      // If this older resident has no cloudId locally, first try to find
-      // the matching resident already in Supabase.
-      if(!residentCloudId){
-        const property=properties.find(p=>p.id===resident.propertyId);
-        const {data:cloudResidents,error:lookupError}=await supabase
-          .from('residents')
-          .select('id,name,email,property_id');
-        if(lookupError) throw lookupError;
-
-        const match=(cloudResidents||[]).find(row=>
-          (resident.email && row.email && row.email.toLowerCase()===resident.email.toLowerCase()) ||
-          (row.name===resident.name && row.property_id===property?.cloudId)
-        );
-
-        if(match){
-          residentCloudId=match.id;
-        }else{
-          if(!property?.cloudId){
-            throw new Error('The resident property is not cloud-connected.');
-          }
-
-          // Resident truly does not exist in Supabase yet. Create payer first
-          // when payer information is available, then create the resident.
-          const payer=payerForResident(resident);
-          let billingContactId=resident.cloudBillingContactId||null;
-
-          if(!billingContactId && (payer.name || payer.email || payer.phone)){
-            const {data:contact,error:contactError}=await supabase
-              .from('billing_contacts')
-              .insert({
-                owner_id:session.user.id,
-                name:payer.name||resident.name,
-                relationship:'Parent / Payer',
-                email:payer.email||'',
-                phone:payer.phone||''
-              })
-              .select()
-              .single();
-            if(contactError) throw contactError;
-            billingContactId=contact.id;
-          }
-
-          const {data:createdResident,error:createResidentError}=await supabase
-            .from('residents')
-            .insert(residentToDb(
-              resident,
-              session.user.id,
-              property.cloudId,
-              billingContactId
-            ))
-            .select()
-            .single();
-
-          if(createResidentError) throw createResidentError;
-          residentCloudId=createdResident.id;
-
-          saveResidents(residents.map(r=>r.id===resident.id?{
-            ...r,
-            cloudId:residentCloudId,
-            cloudBillingContactId:billingContactId
-          }:r));
-        }
-
-        if(match){
-          saveResidents(residents.map(r=>r.id===resident.id?{
-            ...r,
-            cloudId:residentCloudId
-          }:r));
-        }
+    if(session?.user?.id){
+      const resident=residents.find(r=>r.id===next.residentId);
+      if(!resident?.cloudId){
+        alert('Payment saved on this device, but the resident is not cloud-connected yet.');
+        return;
       }
 
-      const {data:createdPayment,error:paymentError}=await supabase
-        .from('payments')
-        .insert(paymentToDb(next,session.user.id,residentCloudId))
+      supabase.from('payments')
+        .insert(paymentToDb(next,session.user.id,resident.cloudId))
         .select()
-        .single();
-
-      if(paymentError) throw paymentError;
-
-      // Only show the payment locally after Supabase confirms the save.
-      savePayments([...payments,{...next,cloudId:createdPayment.id}]);
-
-    }catch(err){
-      console.error('Payment cloud save failed:',err);
-      alert(`Payment was NOT recorded. Cloud save failed: ${err.message||err}`);
+        .single()
+        .then(({data,error})=>{
+          if(error) throw error;
+          savePayments([...payments,{...next,cloudId:data.id}]);
+        })
+        .catch(err=>{
+          console.error('Payment cloud save failed:',err);
+          alert(`Payment saved on this device, but cloud save failed: ${err.message||err}`);
+        });
     }
   };
 
@@ -1007,7 +928,7 @@ export default function App(){
     <aside>
       <div className="brand"><div className="logo">RP</div><div><strong>Rental Pilot</strong><span>Know your rentals in 10 seconds.</span></div></div>
       <nav>{nav.map(([label,Icon])=><button key={label} className={section===label?'active':''} onClick={()=>{setSection(label);if(label!=='Properties')setSelectedPropertyId(null)}}><Icon size={19}/>{label}</button>)}</nav>
-      <div className="aside-foot">Portfolio workspace<br/><small>Version 2.5.1 · Safe Cloud Payments</small><br/><button className="text-button" style={{marginTop:10}} onClick={()=>supabase.auth.signOut()}>Sign out</button></div>
+      <div className="aside-foot">Portfolio workspace<br/><small>Version 2.5 · Vacancy Marketing</small><br/><button className="text-button" style={{marginTop:10}} onClick={()=>supabase.auth.signOut()}>Sign out</button></div>
     </aside>
     <main>
       <header>
@@ -1046,7 +967,7 @@ export default function App(){
       {section==='Expenses' && <Expenses expenses={expenses} properties={properties} month={month} onAdd={()=>setModal({type:'expense'})} onDelete={removeExpense}/>}
       {section==='Documents' && <Documents documents={documents} properties={properties} residents={residents} onAdd={()=>setModal({type:'document'})} onDelete={removeDocument} onOpen={openDocument}/>}
       {section==='Buy Box' && <BuyBox/>}
-      {section==='Reminders' && <Reminders residents={residents} payments={payments} month={month}/>}
+      {section==='Reminders' && <Reminders residents={residents} properties={properties} payments={payments} month={month}/>}
       {section==='Maintenance' && <Maintenance maintenance={maintenance} properties={properties} onAdd={()=>setModal({type:'maintenance'})} onStatus={updateMaintenance} onDelete={removeMaintenance}/>}
 
     </main>
@@ -1105,11 +1026,31 @@ function MonthPicker({month,setMonth}){
   </div>
 }
 function paidForMonth(payments,residentId,month){return payments.filter(p=>p.residentId===residentId&&p.month===month).reduce((s,p)=>s+Number(p.amount),0)}
-function residentBalance(payments,r,month){return Math.max(0,Number(r.rent||0)-paidForMonth(payments,r.id,month))}
+function isVariableIncomeResident(r,properties=[]){
+  const property=properties.find(p=>p.id===r?.propertyId);
+  const label=`${property?.shortName||''} ${property?.name||''}`.toLowerCase();
+  return label.includes('boardwalk');
+}
+function expectedRentForMonth(r,month,properties=[]){
+  if(!r) return 0;
+  if(isVariableIncomeResident(r,properties)) return 0;
+  const rent=Number(r.rent||0);
+  const leaseStart=String(r.leaseStart||'');
+  if(leaseStart && leaseStart.slice(0,7)===month){
+    const startDay=Number(leaseStart.slice(8,10))||1;
+    if(startDay>1){
+      // First-month proration uses a simple 30-day rent convention.
+      const fraction=Math.min(1,Math.max(0,(31-startDay)/30));
+      return Math.round(rent*fraction*100)/100;
+    }
+  }
+  return rent;
+}
+function residentBalance(payments,r,month,properties=[]){return Math.max(0,expectedRentForMonth(r,month,properties)-paidForMonth(payments,r.id,month))}
 function Stat({label,value,sub,tone}){return <div className={`stat ${tone||''}`}><span>{label}</span><strong>{value}</strong><small>{sub}</small></div>}
 
 function CommandCenter({properties,residents,payments,expenses,maintenance,month,onRecord,onGo,onReviewLease}){
-  const scheduled=residents.reduce((s,r)=>s+Number(r.rent||0),0);
+  const scheduled=residents.reduce((s,r)=>s+expectedRentForMonth(r,month,properties),0);
   const collected=payments.filter(p=>p.month===month).reduce((s,p)=>s+Number(p.amount),0);
   const outstanding=Math.max(0,scheduled-collected);
   const monthExpenses=expenses.filter(e=>(e.date||'').startsWith(month)).reduce((s,e)=>s+Number(e.amount||0),0);
@@ -1119,7 +1060,7 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
 
   const dueResidents=residents.map(r=>{
     const paid=paidForMonth(payments,r.id,month);
-    const balance=Math.max(0,Number(r.rent||0)-paid);
+    const balance=Math.max(0,expectedRentForMonth(r,month,properties)-paid);
     const dueDay=Number(r.dueDay)||1;
     const [y,m]=month.split('-').map(Number);
     const dueDate=new Date(y,m-1,dueDay);
@@ -1303,12 +1244,12 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
 function RentTable({properties,residents:rs,payments,month,onRecord,onDelete}){
   return <div className="table">
     <div className="tr th"><span>Resident</span><span>Suite</span><span>Rent</span><span>Status</span></div>
-    {rs.map(r=>{const paid=paidForMonth(payments,r.id,month);const balance=residentBalance(payments,r,month);return <div className="tr clickable" key={r.id} onClick={()=>onRecord?.(r)}>
+    {rs.map(r=>{const paid=paidForMonth(payments,r.id,month);const variable=isVariableIncomeResident(r,properties);const balance=residentBalance(payments,r,month,properties);return <div className="tr clickable" key={r.id} onClick={()=>onRecord?.(r)}>
       <span><strong>{r.name}</strong><small>{r.payerName||payers.find(p=>p.id===r.payerId)?.name||r.email||''}</small></span>
       <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
       <span>{money(r.rent)}</span>
       <span style={{display:'flex',gap:8,alignItems:'center'}}>
-        <button className={balance===0?'paid':paid>0?'partial':'due'}>{balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+        <button className={variable?'paid':balance===0?'paid':paid>0?'partial':'due'}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
         {onDelete&&<button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>}
       </span>
     </div>})}
@@ -1326,13 +1267,14 @@ function Residents({properties,query,setQuery,residents:rs,payments,month,onReco
       <div className="tr th"><span>Resident</span><span>Suite</span><span>Rent</span><span>Status</span></div>
       {rs.map(r=>{
         const paid=paidForMonth(payments,r.id,month);
-        const balance=residentBalance(payments,r,month);
+        const variable=isVariableIncomeResident(r,properties);
+        const balance=residentBalance(payments,r,month,properties);
         return <div className="tr clickable" key={r.id} onClick={()=>onEdit?.(r)}>
           <span><strong>{r.name}</strong><small>{r.payerName||payers.find(p=>p.id===r.payerId)?.name||r.email||''}</small></span>
           <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
           <span>{money(r.rent)}</span>
           <span style={{display:'flex',gap:8,alignItems:'center'}}>
-            <button className={balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+            <button className={variable?'paid':balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
             <button className="secondary" onClick={e=>{e.stopPropagation();onEdit?.(r)}}>Edit</button>
             <button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>
           </span>
@@ -1576,10 +1518,10 @@ function Expenses({expenses,properties,month,onAdd,onDelete}){
   </>
 }
 
-function Reminders({residents,payments,month}){
-  const due=residents.filter(r=>residentBalance(payments,r,month)>0);
+function Reminders({residents,properties,payments,month}){
+  const due=residents.filter(r=>residentBalance(payments,r,month,properties)>0);
   return <div className="card"><div className="card-head"><div><h2>Friendly reminder queue</h2><p>Billing contacts with a {monthLabel(month)} balance</p></div></div><div className="reminders">
-    {due.map(r=>{const p=payers.find(x=>x.id===r.payerId);const payerName=r.payerName||p?.name||r.name;const email=r.payerEmail||p?.email||r.email||'';const balance=residentBalance(payments,r,month);return <div className="reminder" key={r.id}><div><strong>{payerName}</strong><span>{r.name} · {money(balance)} remaining</span><small>{email}</small></div><button onClick={()=>navigator.clipboard?.writeText(`Hi ${payerName.split(' ')[0]}, this is a friendly reminder that ${money(balance)} for ${r.name}'s ${monthLabel(month)} rent is still outstanding. If you've already sent it, please disregard this message. Thank you!`)}>Copy message</button></div>})}
+    {due.map(r=>{const p=payers.find(x=>x.id===r.payerId);const payerName=r.payerName||p?.name||r.name;const email=r.payerEmail||p?.email||r.email||'';const balance=residentBalance(payments,r,month,properties);return <div className="reminder" key={r.id}><div><strong>{payerName}</strong><span>{r.name} · {money(balance)} remaining</span><small>{email}</small></div><button onClick={()=>navigator.clipboard?.writeText(`Hi ${payerName.split(' ')[0]}, this is a friendly reminder that ${money(balance)} for ${r.name}'s ${monthLabel(month)} rent is still outstanding. If you've already sent it, please disregard this message. Thank you!`)}>Copy message</button></div>})}
     {!due.length&&<Empty title="Everyone is paid" text={`There are no ${monthLabel(month)} reminders to send.`}/>}
   </div></div>
 }
@@ -1615,16 +1557,20 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
   const [residentId,setResidentId]=useState(firstId);
   const resident=residents.find(r=>r.id===residentId);
   const rent=Number(resident?.rent||0);
+  const variableIncome=resident ? isVariableIncomeResident(resident,properties) : false;
+  const expected=resident ? expectedRentForMonth(resident,month,properties) : 0;
   const alreadyPaid=resident ? paidForMonth(payments||[],resident.id,month) : 0;
-  const remaining=Math.max(0,rent-alreadyPaid);
-  const [amount,setAmount]=useState(remaining);
+  const remaining=Math.max(0,expected-alreadyPaid);
+  const [amount,setAmount]=useState(variableIncome?'':remaining);
   const [method,setMethod]=useState('Venmo');
   const [date,setDate]=useState(todayISO());
 
   useEffect(()=>{
     if(!resident) return;
     const paid=paidForMonth(payments||[],resident.id,month);
-    setAmount(Math.max(0,Number(resident.rent||0)-paid));
+    const variable=isVariableIncomeResident(resident,properties);
+    const monthExpected=expectedRentForMonth(resident,month,properties);
+    setAmount(variable?'':Math.max(0,monthExpected-paid));
   },[residentId,month]);
 
   const changeResident=id=>setResidentId(id);
@@ -1633,7 +1579,7 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
     const numericAmount=Number(amount);
     if(!residentId) return alert('Please choose a resident.');
     if(!numericAmount || numericAmount<=0) return alert('Please enter a payment amount greater than $0.');
-    if(numericAmount>remaining && remaining>0){
+    if(!variableIncome && numericAmount>remaining && remaining>0){
       if(!window.confirm(`${money(numericAmount)} is more than the ${money(remaining)} remaining balance. Record it anyway?`)) return;
     }
     onSave({residentId,amount:numericAmount,method,date,month});
@@ -1651,12 +1597,18 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
     </label>
 
     <div className="result-grid" style={{margin:'12px 0 16px'}}>
-      <Result label="Monthly rent" value={money(rent)}/>
-      <Result label="Already paid" value={money(alreadyPaid)} tone={alreadyPaid>0?'good-text':''}/>
-      <Result label="Remaining" value={money(remaining)} tone={remaining===0?'good-text':'bad-text'}/>
+      <Result label={variableIncome?'Income type':'Normal monthly rent'} value={variableIncome?'Variable':money(rent)}/>
+      <Result label="Expected this month" value={variableIncome?'No fixed amount':money(expected)}/>
+      <Result label="Already received" value={money(alreadyPaid)} tone={alreadyPaid>0?'good-text':''}/>
+      {!variableIncome && <Result label="Remaining" value={money(remaining)} tone={remaining===0?'good-text':'bad-text'}/>} 
     </div>
 
-    {remaining===0 && <div className="empty" style={{padding:14,marginBottom:14}}>
+    {variableIncome && <div className="empty" style={{padding:14,marginBottom:14}}>
+      <strong>Variable income property</strong>
+      <p>Enter whatever was actually received this month. There is no fixed amount due.</p>
+    </div>}
+
+    {!variableIncome && remaining===0 && <div className="empty" style={{padding:14,marginBottom:14}}>
       <strong>Paid in full for {monthLabel(month)}</strong>
       <p>This resident has no remaining balance for the selected month.</p>
     </div>}
@@ -1666,7 +1618,7 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
     </label>
 
     <div className="method-grid" style={{marginBottom:16}}>
-      <button type="button" className="method active" onClick={()=>setAmount(remaining)} disabled={remaining<=0}>Full Balance · {money(remaining)}</button>
+      {!variableIncome && <button type="button" className="method active" onClick={()=>setAmount(remaining)} disabled={remaining<=0}>Full Balance · {money(remaining)}</button>}
       <button type="button" className="method" onClick={()=>setAmount('')}>Custom Amount</button>
     </div>
 
