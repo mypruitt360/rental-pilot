@@ -51,6 +51,14 @@ function loadResidents(){ return load(RESIDENT_KEY,seedResidents,false); }
 function loadMaintenance(){ return load(MAINTENANCE_KEY,[]); }
 function loadExpenses(){ return load(EXPENSE_KEY,[]); }
 function loadDocuments(){ return load(DOCUMENT_KEY,[]); }
+async function readWithClockRetry(run){
+  let result=await run();
+  if(result.error?.message?.includes('JWT issued at future')){
+    await new Promise(resolve=>setTimeout(resolve,3000));
+    result=await run();
+  }
+  return result;
+}
 function documentFromDb(r,properties,residents){
   const property=properties.find(p=>p.cloudId===r.property_id||p.id===r.property_id);
   const resident=residents.find(x=>x.cloudId===r.resident_id||x.id===r.resident_id);
@@ -280,7 +288,7 @@ export default function App(){
   useEffect(()=>{
     if(!session?.user?.id) return;
     let cancelled=false;
-    supabase.from('documents').select('*').order('created_at',{ascending:false})
+    readWithClockRetry(()=>supabase.from('documents').select('*').order('created_at',{ascending:false}))
       .then(({data,error})=>{
         if(error) throw error;
         if(!cancelled) saveDocuments((data||[]).map(r=>documentFromDb(r,properties,residents)));
@@ -297,10 +305,7 @@ export default function App(){
     let cancelled=false;
 
     const syncProperties=async()=>{
-      const {data:rows,error}=await supabase
-        .from('properties')
-        .select('*')
-        .order('created_at',{ascending:true});
+      const {data:rows,error}=await readWithClockRetry(()=>supabase.from('properties').select('*').order('created_at',{ascending:true}));
       if(error) throw error;
 
       const local=loadProperties();
@@ -360,10 +365,7 @@ export default function App(){
 
     const syncResidents=async()=>{
       try{
-        const {data:rows,error}=await supabase
-          .from('residents')
-          .select('*, billing_contacts(*)')
-          .order('created_at',{ascending:true});
+        const {data:rows,error}=await readWithClockRetry(()=>supabase.from('residents').select('*, billing_contacts(*)').order('created_at',{ascending:true}));
         if(error) throw error;
 
         if((rows||[]).length===0){
@@ -448,10 +450,7 @@ export default function App(){
     let cancelled=false;
 
     const syncPayments=async()=>{
-      const {data:rows,error}=await supabase
-        .from('payments')
-        .select('*')
-        .order('paid_on',{ascending:true});
+      const {data:rows,error}=await readWithClockRetry(()=>supabase.from('payments').select('*').order('paid_on',{ascending:true}));
       if(error) throw error;
 
       // Once signed in, Supabase is the source of truth.
@@ -483,10 +482,7 @@ export default function App(){
     let cancelled=false;
 
     const syncMaintenance=async()=>{
-      const {data:rows,error}=await supabase
-        .from('maintenance')
-        .select('*')
-        .order('created_at',{ascending:true});
+      const {data:rows,error}=await readWithClockRetry(()=>supabase.from('maintenance').select('*').order('created_at',{ascending:true}));
       if(error) throw error;
 
       // Supabase is the source of truth for maintenance.
@@ -515,10 +511,7 @@ export default function App(){
     let cancelled=false;
 
     const syncExpenses=async()=>{
-      const {data:rows,error}=await supabase
-        .from('expenses')
-        .select('*')
-        .order('incurred_on',{ascending:true});
+      const {data:rows,error}=await readWithClockRetry(()=>supabase.from('expenses').select('*').order('incurred_on',{ascending:true}));
       if(error) throw error;
 
       // Once cloud expenses exist, Supabase is the source of truth.
