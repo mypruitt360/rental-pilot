@@ -172,7 +172,8 @@ function paymentToDb(p,userId,residentCloudId){
     resident_id:residentCloudId,
     amount:Number(p.amount)||0,
     paid_on:p.date||p.paidOn||todayISO(),
-    method:p.method||'Other'
+    method:p.method||'Other',
+    payment_type:p.paymentType||'Rent'
   };
 }
 
@@ -187,6 +188,7 @@ function paymentFromDb(r,residents,localExisting=null){
     amount:Number(r.amount)||0,
     date:paidOn,
     method:r.method||'Other',
+    paymentType:r.payment_type||'Rent',
     month:String(paidOn).slice(0,7)
   };
 }
@@ -915,31 +917,15 @@ export default function App(){
     saveDocuments(documents.filter(d=>d.id!==id));
   };
 
-  const upsertPayment = payment => {
-    const paymentMonth=payment.month||month;
-    const next={id:`pay-${Date.now()}`,...payment,month:paymentMonth};
-    savePayments([...payments,next]);
-
-    if(session?.user?.id){
-      const resident=residents.find(r=>r.id===next.residentId);
-      if(!resident?.cloudId){
-        alert('Payment saved on this device, but the resident is not cloud-connected yet.');
-        return;
-      }
-
-      supabase.from('payments')
-        .insert(paymentToDb(next,session.user.id,resident.cloudId))
-        .select()
-        .single()
-        .then(({data,error})=>{
-          if(error) throw error;
-          savePayments([...payments,{...next,cloudId:data.id}]);
-        })
-        .catch(err=>{
-          console.error('Payment cloud save failed:',err);
-          alert(`Payment saved on this device, but cloud save failed: ${err.message||err}`);
-        });
-    }
+  const upsertPayment = async payment => {
+    if(!session?.user?.id) throw new Error('Please sign in first.');
+    const resident=residents.find(r=>r.id===payment.residentId);
+    if(!resident?.cloudId) throw new Error('Resident is still syncing. Please try again shortly.');
+    const {data,error}=await supabase.from('payments')
+      .insert(paymentToDb(payment,session.user.id,resident.cloudId))
+      .select().single();
+    if(error) throw error;
+    savePayments([...payments,paymentFromDb(data,residents)]);
   };
 
   const removePayment = id => {
@@ -1016,7 +1002,7 @@ export default function App(){
     {modal?.type==='property-edit' && <PropertyModal mode="edit" initial={modal.property} onClose={()=>setModal(null)} onSave={p=>{updateProperty(modal.property.id,p);setModal(null);}}/>}
     {modal?.type==='resident' && <ResidentModal mode="add" properties={properties} onClose={()=>setModal(null)} onSave={r=>{addResident(r);setModal(null);setSection('Residents');}}/>}
     {modal?.type==='resident-edit' && <ResidentModal mode="edit" initial={modal.resident} properties={properties} onClose={()=>setModal(null)} onSave={async r=>{await updateResident(modal.resident.id,r);setModal(null);setSection('Residents');}}/>}
-    {modal?.type==='payment' && <PaymentModal properties={properties} residents={residents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={p=>{upsertPayment(p);setModal(null);}}/>}
+    {modal?.type==='payment' && <PaymentModal properties={properties} residents={residents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={async p=>{await upsertPayment(p);setModal(null);}}/>}
     {modal?.type==='maintenance' && <MaintenanceModal properties={properties} onClose={()=>setModal(null)} onSave={m=>{addMaintenance(m); if(Number(m.actualCost)>0){addExpense({propertyId:m.propertyId,category:'Repairs & Maintenance',amount:Number(m.actualCost),date:m.datePaid||todayISO(),vendor:m.vendor||'',method:m.paymentMethod||'',notes:m.title});} setModal(null);}}/>}
     {modal?.type==='expense' && <ExpenseModal properties={properties} onClose={()=>setModal(null)} onSave={e=>{addExpense(e);setModal(null);setSection('Expenses');}}/>}
     {modal?.type==='document' && <DocumentModal properties={properties} residents={residents} onClose={()=>setModal(null)} onSave={async d=>{try{await addDocument(d);setModal(null);setSection('Documents');}catch(err){alert(err.message||'Upload failed');}}}/>}
@@ -1065,7 +1051,7 @@ function MonthPicker({month,setMonth}){
     <span>{monthLabel(month)}</span>
   </div>
 }
-function paidForMonth(payments,residentId,month){return payments.filter(p=>p.residentId===residentId&&p.month===month).reduce((s,p)=>s+Number(p.amount),0)}
+function paidForMonth(payments,residentId,month){return payments.filter(p=>p.residentId===residentId&&p.month===month&&(p.paymentType||'Rent')==='Rent').reduce((s,p)=>s+Number(p.amount),0)}
 function isVariableIncomeResident(r,properties=[]){
   const property=properties.find(p=>p.id===r?.propertyId);
   const label=`${property?.shortName||''} ${property?.name||''}`.toLowerCase();
@@ -1076,6 +1062,7 @@ function expectedRentForMonth(r,month,properties=[]){
   if(isVariableIncomeResident(r,properties)) return 0;
   const rent=Number(r.rent||0);
   const leaseStart=String(r.leaseStart||'');
+  if(leaseStart && month<leaseStart.slice(0,7)) return 0;
   if(leaseStart && leaseStart.slice(0,7)===month){
     const startDay=Number(leaseStart.slice(8,10))||1;
     if(startDay>1){
@@ -1091,7 +1078,7 @@ function Stat({label,value,sub,tone}){return <div className={`stat ${tone||''}`}
 
 function CommandCenter({properties,residents,payments,expenses,maintenance,month,onRecord,onGo,onReviewLease}){
   const scheduled=residents.reduce((s,r)=>s+expectedRentForMonth(r,month,properties),0);
-  const collected=payments.filter(p=>p.month===month).reduce((s,p)=>s+Number(p.amount),0);
+  const collected=payments.filter(p=>p.month===month&&(p.paymentType||'Rent')==='Rent').reduce((s,p)=>s+Number(p.amount),0);
   const outstanding=Math.max(0,scheduled-collected);
   const monthExpenses=expenses.filter(e=>(e.date||'').startsWith(month)).reduce((s,e)=>s+Number(e.amount||0),0);
   const netCollected=collected-monthExpenses;
@@ -1114,7 +1101,8 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
 
   const partialCount=dueResidents.filter(r=>r.paid>0).length;
   const unpaidCount=dueResidents.filter(r=>r.paid===0).length;
-  const paidCount=residents.length-dueResidents.length;
+  const rentResidents=residents.filter(r=>expectedRentForMonth(r,month,properties)>0);
+  const paidCount=rentResidents.length-dueResidents.length;
 
   const today=new Date();
   today.setHours(0,0,0,0);
@@ -1170,7 +1158,7 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
     </section>
 
     <section className="stats">
-      <Stat label="Residents paid" value={`${paidCount}/${residents.length}`} sub={`${paidCount} paid in full`}/>
+      <Stat label="Residents paid" value={`${paidCount}/${rentResidents.length}`} sub={`${paidCount} paid in full`}/>
       <Stat label="Residents due" value={dueResidents.length} sub={`${unpaidCount} unpaid · ${partialCount} partial`}/>
       <Stat label="Outstanding rent" value={money(outstanding)} sub={`${monthLabel(month)} balance`} tone={outstanding>0?'opportunity':''}/>
       <Stat label="Lease alerts" value={leaseAlerts.length} sub={urgentLeaseCount?`${urgentLeaseCount} due within 30 days`:'Next 90 days' } tone={leaseAlerts.length?'opportunity':''}/>
@@ -1289,7 +1277,7 @@ function RentTable({properties,residents:rs,payments,month,onRecord,onDelete}){
       <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
       <span>{money(r.rent)}</span>
       <span style={{display:'flex',gap:8,alignItems:'center'}}>
-        <button className={variable?'paid':balance===0?'paid':paid>0?'partial':'due'}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+        <button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
         {onDelete&&<button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>}
       </span>
     </div>})}
@@ -1314,7 +1302,7 @@ function Residents({properties,query,setQuery,residents:rs,payments,month,onReco
           <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
           <span>{money(r.rent)}</span>
           <span style={{display:'flex',gap:8,alignItems:'center'}}>
-            <button className={variable?'paid':balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+            <button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
             <button className="secondary" onClick={e=>{e.stopPropagation();onEdit?.(r)}}>Edit</button>
             <button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>
           </span>
@@ -1370,7 +1358,7 @@ function PropertyDetail({property,residents,payments,expenses,maintenance,docume
 
   const year=month.split('-')[0];
   const selectedMonthNumber=Math.max(1,Number(month.split('-')[1])||1);
-  const ytdPayments=payments.filter(p=>propertyResidentIds.has(p.residentId)&&(p.date||'').startsWith(year));
+  const ytdPayments=payments.filter(p=>propertyResidentIds.has(p.residentId)&&(p.paymentType||'Rent')==='Rent'&&(p.date||'').startsWith(year));
   const ytdCollected=ytdPayments.reduce((s,p)=>s+Number(p.amount||0),0);
   const ytdVariableExpenses=variableExpenses
     .filter(e=>(e.date||'').startsWith(year))
@@ -1490,7 +1478,7 @@ function Payments({residents,properties,payments,month,onRecord,onDelete}){
   const sorted=[...payments].filter(p=>p.month===month).sort((a,b)=>(b.date||'').localeCompare(a.date||''));
   return <div className="card"><div className="card-head"><div><h2>Payment ledger</h2><p>{monthLabel(month)} payments and methods</p></div><button className="secondary" onClick={onRecord}><Plus size={16}/> Add payment</button></div>
     <div className="ledger"><div className="ledger-row ledger-head"><span>Date</span><span>Resident</span><span>Method</span><span>Amount</span><span></span></div>
-      {sorted.map(p=><div className="ledger-row" key={p.id}><span>{p.date}</span><span>{residents.find(r=>r.id===p.residentId)?.name||'Former resident'}</span><span>{p.method}</span><strong>{money(p.amount)}</strong><button className="icon-button" onClick={()=>onDelete(p.id)}><X size={15}/></button></div>)}
+      {sorted.map(p=><div className="ledger-row" key={p.id}><span>{p.date}</span><span>{residents.find(r=>r.id===p.residentId)?.name||'Former resident'}</span><span>{p.paymentType==='Security deposit'?'Security deposit · ':''}{p.method}</span><strong>{money(p.amount)}</strong><button className="icon-button" onClick={()=>onDelete(p.id)}><X size={15}/></button></div>)}
       {!sorted.length&&<p>No payments recorded for {monthLabel(month)}.</p>}
     </div>
   </div>
@@ -1598,86 +1586,90 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
   const resident=residents.find(r=>r.id===residentId);
   const rent=Number(resident?.rent||0);
   const variableIncome=resident ? isVariableIncomeResident(resident,properties) : false;
+  const futureLease=!!(resident?.leaseStart && resident.leaseStart>todayISO());
+  const [paymentType,setPaymentType]=useState(futureLease?'Security deposit':'Rent');
   const expected=resident ? expectedRentForMonth(resident,month,properties) : 0;
   const alreadyPaid=resident ? paidForMonth(payments||[],resident.id,month) : 0;
   const remaining=Math.max(0,expected-alreadyPaid);
-  const [amount,setAmount]=useState(variableIncome?'':remaining);
+  const [amount,setAmount]=useState('');
   const [method,setMethod]=useState('Venmo');
   const [date,setDate]=useState(todayISO());
+  const [saving,setSaving]=useState(false);
+
+  useEffect(()=>{
+    if(!resident) return;
+    const future=!!(resident.leaseStart&&resident.leaseStart>todayISO());
+    setPaymentType(future?'Security deposit':'Rent');
+  },[residentId]);
 
   useEffect(()=>{
     if(!resident) return;
     const paid=paidForMonth(payments||[],resident.id,month);
-    const variable=isVariableIncomeResident(resident,properties);
     const monthExpected=expectedRentForMonth(resident,month,properties);
-    setAmount(variable?'':Math.max(0,monthExpected-paid));
-  },[residentId,month]);
+    setAmount(paymentType==='Rent'&&!isVariableIncomeResident(resident,properties)
+      ?Math.max(0,monthExpected-paid):'');
+  },[residentId,month,paymentType]);
 
-  const changeResident=id=>setResidentId(id);
-
-  const save=()=>{
+  const save=async()=>{
     const numericAmount=Number(amount);
     if(!residentId) return alert('Please choose a resident.');
-    if(!numericAmount || numericAmount<=0) return alert('Please enter a payment amount greater than $0.');
-    if(!variableIncome && numericAmount>remaining && remaining>0){
-      if(!window.confirm(`${money(numericAmount)} is more than the ${money(remaining)} remaining balance. Record it anyway?`)) return;
+    if(!numericAmount||numericAmount<=0) return alert('Please enter a payment amount greater than $0.');
+    if(paymentType==='Rent'&&!variableIncome&&numericAmount>remaining&&remaining>0){
+      if(!window.confirm(`${money(numericAmount)} is more than the ${money(remaining)} remaining rent balance. Record it anyway?`)) return;
     }
-    onSave({residentId,amount:numericAmount,method,date,month});
+    setSaving(true);
+    try{await onSave({residentId,amount:numericAmount,method,date,paymentType});}
+    catch(err){alert('Payment could not be saved: '+(err.message||err));}
+    finally{setSaving(false);}
   };
 
   if(!residents.length) return <div className="modal-backdrop" onMouseDown={onClose}><div className="modal" onMouseDown={e=>e.stopPropagation()}><div className="modal-head"><h2>No residents yet</h2><button className="icon-button" onClick={onClose}><X/></button></div><p>Add a resident before recording a payment.</p></div></div>;
 
   return <div className="modal-backdrop" onMouseDown={onClose}><div className="modal" style={{maxHeight:'88vh',overflowY:'auto',paddingBottom:24}} onMouseDown={e=>e.stopPropagation()}>
-    <div className="modal-head" style={{position:'sticky',top:0,zIndex:4,background:'white',paddingBottom:10}}><div><h2>Record Payment</h2><p>{monthLabel(month)} · rent collection</p></div><button className="icon-button" onClick={onClose}><X/></button></div>
+    <div className="modal-head" style={{position:'sticky',top:0,zIndex:4,background:'white',paddingBottom:10}}><div><h2>Record Payment</h2><p>Record the date received; security deposits are separate from rent.</p></div><button className="icon-button" onClick={onClose}><X/></button></div>
 
     <label>Resident
-      <select value={residentId} onChange={e=>changeResident(e.target.value)}>
+      <select value={residentId} onChange={e=>setResidentId(e.target.value)}>
         {residents.map(r=><option value={r.id} key={r.id}>{r.name} · {properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</option>)}
       </select>
     </label>
-
-    <div className="result-grid" style={{margin:'12px 0 16px'}}>
-      <Result label={variableIncome?'Income type':'Normal monthly rent'} value={variableIncome?'Variable':money(rent)}/>
-      <Result label="Expected this month" value={variableIncome?'No fixed amount':money(expected)}/>
-      <Result label="Already received" value={money(alreadyPaid)} tone={alreadyPaid>0?'good-text':''}/>
-      {!variableIncome && <Result label="Remaining" value={money(remaining)} tone={remaining===0?'good-text':'bad-text'}/>} 
-    </div>
-
-    {variableIncome && <div className="empty" style={{padding:14,marginBottom:14}}>
-      <strong>Variable income property</strong>
-      <p>Enter whatever was actually received this month. There is no fixed amount due.</p>
-    </div>}
-
-    {!variableIncome && remaining===0 && <div className="empty" style={{padding:14,marginBottom:14}}>
-      <strong>Paid in full for {monthLabel(month)}</strong>
-      <p>This resident has no remaining balance for the selected month.</p>
-    </div>}
-
-    <label>Payment amount
-      <input type="number" min="0" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)}/>
+    <label>Payment type
+      <select value={paymentType} onChange={e=>setPaymentType(e.target.value)}>
+        <option>Security deposit</option><option>Rent</option>
+      </select>
     </label>
 
-    <div className="method-grid" style={{marginBottom:16}}>
+    {paymentType==='Rent'?<>
+      <div className="result-grid" style={{margin:'12px 0 16px'}}>
+        <Result label={variableIncome?'Income type':'Normal monthly rent'} value={variableIncome?'Variable':money(rent)}/>
+        <Result label="Expected this month" value={variableIncome?'No fixed amount':money(expected)}/>
+        <Result label="Already received" value={money(alreadyPaid)} tone={alreadyPaid>0?'good-text':''}/>
+        {!variableIncome && <Result label="Remaining" value={money(remaining)} tone={remaining===0?'good-text':'bad-text'}/>}
+      </div>
+      {resident?.leaseStart&&month<resident.leaseStart.slice(0,7)&&
+        <div className="empty" style={{padding:14,marginBottom:14}}><strong>Rent starts {resident.leaseStart}</strong><p>No rent is due for {monthLabel(month)}. Select Security deposit to record a deposit received now.</p></div>}
+      {variableIncome && <div className="empty" style={{padding:14,marginBottom:14}}><strong>Variable income property</strong><p>Enter whatever was actually received this month. There is no fixed amount due.</p></div>}
+      {!variableIncome && expected>0 && remaining===0 && <div className="empty" style={{padding:14,marginBottom:14}}><strong>Paid in full for {monthLabel(month)}</strong><p>This resident has no remaining rent balance for the selected month.</p></div>}
+    </>:<div className="empty" style={{padding:14,margin:'12px 0 16px'}}>
+      <strong>Security deposit</strong><p>Record the amount and actual date received. This will appear in Payments without reducing rent due.</p>
+    </div>}
+
+    <label>Payment amount<input type="number" min="0" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)}/></label>
+    {paymentType==='Rent'&&<div className="method-grid" style={{marginBottom:16}}>
       {!variableIncome && <button type="button" className="method active" onClick={()=>setAmount(remaining)} disabled={remaining<=0}>Full Balance · {money(remaining)}</button>}
       <button type="button" className="method" onClick={()=>setAmount('')}>Custom Amount</button>
-    </div>
-
-    <label>Payment method
-      <div className="method-grid">
-        {['Venmo','ACH','Check','Cash','Other'].map(m=><button type="button" className={method===m?'method active':'method'} onClick={()=>setMethod(m)} key={m}>{m}</button>)}
-      </div>
-    </label>
-
+    </div>}
+    <label>Payment method<div className="method-grid">
+      {['Venmo','ACH','Check','Cash','Other'].map(m=><button type="button" className={method===m?'method active':'method'} onClick={()=>setMethod(m)} key={m}>{m}</button>)}
+    </div></label>
     <label>Date received<input type="date" value={date} onChange={e=>setDate(e.target.value)}/></label>
-
     <div style={{position:'sticky',bottom:0,zIndex:4,background:'white',paddingTop:14,paddingBottom:4}}>
-      <button className="primary wide save" onClick={save} disabled={!Number(amount)||Number(amount)<=0}>
-        <Save size={17}/> Record {Number(amount)>0?money(Number(amount)):'Payment'}
+      <button className="primary wide save" onClick={save} disabled={saving||!Number(amount)||Number(amount)<=0}>
+        <Save size={17}/> {saving?'Saving…':`Record ${money(Number(amount))} ${paymentType==='Rent'?'rent':'deposit'}`}
       </button>
     </div>
   </div></div>
 }
-
 function ResidentModal({mode='add',initial=null,properties,onClose,onSave}){
   const base={name:'',propertyId:properties[0]?.id||'',rent:'',email:'',phone:'',payerName:'',payerEmail:'',payerPhone:'',leaseStart:'',leaseEnd:'',renewalStatus:'Undecided',marketingStatus:'Not Listed',dueDay:1};
   const [form,setForm]=useState(()=>initial?{
