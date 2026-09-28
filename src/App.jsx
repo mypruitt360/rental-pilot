@@ -51,6 +51,17 @@ function loadResidents(){ return load(RESIDENT_KEY,seedResidents,false); }
 function loadMaintenance(){ return load(MAINTENANCE_KEY,[]); }
 function loadExpenses(){ return load(EXPENSE_KEY,[]); }
 function loadDocuments(){ return load(DOCUMENT_KEY,[]); }
+function documentFromDb(r,properties,residents){
+  const property=properties.find(p=>p.cloudId===r.property_id||p.id===r.property_id);
+  const resident=residents.find(x=>x.cloudId===r.resident_id||x.id===r.resident_id);
+  return {
+    id:r.id,cloudId:r.id,name:r.name,category:r.document_type,
+    propertyId:property?.id||'',residentId:resident?.id||'',
+    documentDate:r.document_date||'',fileName:r.file_name||'',
+    storagePath:r.file_path,notes:r.notes||'',
+    uploadedAt:String(r.created_at||'').slice(0,10)
+  };
+}
 
 function propertyToDb(p,userId){
   return {
@@ -263,6 +274,21 @@ export default function App(){
     const {data:listener}=supabase.auth.onAuthStateChange((_event,nextSession)=>{setSession(nextSession);setAuthReady(true);});
     return ()=>listener.subscription.unsubscribe();
   },[]);
+
+  useEffect(()=>{
+    if(!session?.user?.id) return;
+    let cancelled=false;
+    supabase.from('documents').select('*').order('created_at',{ascending:false})
+      .then(({data,error})=>{
+        if(error) throw error;
+        if(!cancelled) saveDocuments((data||[]).map(r=>documentFromDb(r,properties,residents)));
+      })
+      .catch(err=>{
+        console.error('Document cloud load failed:',err);
+        if(!cancelled) alert('Documents could not load: '+(err.message||err));
+      });
+    return ()=>{cancelled=true;};
+  },[session?.user?.id,properties,residents]);
 
   useEffect(()=>{
     if(!session?.user?.id) return;
@@ -846,17 +872,27 @@ export default function App(){
   };
   const addDocument = async doc => {
     if(!session?.user) throw new Error('Please sign in first.');
-    const id=`doc-${Date.now()}`;
-    let storagePath='';
-    if(doc.file){
-      const safe=doc.file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
-      storagePath=`${session.user.id}/${Date.now()}-${safe}`;
-      const {error}=await supabase.storage.from('rental-pilot-documents').upload(storagePath,doc.file,{upsert:false,contentType:doc.file.type||undefined});
-      if(error) throw error;
+    if(!doc.file) throw new Error('Please choose a file.');
+    const property=properties.find(p=>p.id===doc.propertyId);
+    const resident=residents.find(r=>r.id===doc.residentId);
+    if(doc.propertyId && !property?.cloudId) throw new Error('Property is still syncing. Please try again shortly.');
+    if(doc.residentId && !resident?.cloudId) throw new Error('Resident is still syncing. Please try again shortly.');
+    const safe=doc.file.name.replace(/[^a-zA-Z0-9._-]/g,'_');
+    const storagePath=`${session.user.id}/${Date.now()}-${safe}`;
+    const {error:uploadError}=await supabase.storage.from('rental-pilot-documents')
+      .upload(storagePath,doc.file,{upsert:false,contentType:doc.file.type||undefined});
+    if(uploadError) throw uploadError;
+    const {data,error}=await supabase.from('documents').insert({
+      owner_id:session.user.id,property_id:property?.cloudId||null,
+      resident_id:resident?.cloudId||null,name:doc.name,
+      document_type:doc.category,document_date:doc.documentDate||null,
+      file_name:doc.fileName||doc.file.name,file_path:storagePath,notes:doc.notes||null
+    }).select().single();
+    if(error){
+      await supabase.storage.from('rental-pilot-documents').remove([storagePath]);
+      throw error;
     }
-    const clean={...doc};
-    delete clean.file;
-    saveDocuments([{id,uploadedAt:todayISO(),storagePath,...clean},...documents]);
+    saveDocuments([documentFromDb(data,properties,residents),...documents]);
   };
   const openDocument = async doc => {
     if(!doc.storagePath) return alert('This record was created before cloud uploads were connected.');
@@ -868,9 +904,13 @@ export default function App(){
     const doc=documents.find(d=>d.id===id);
     if(!doc) return;
     if(!window.confirm(`Delete ${doc.name}?`)) return;
+    if(doc.cloudId){
+      const {error}=await supabase.from('documents').delete().eq('id',doc.cloudId);
+      if(error) return alert(error.message);
+    }
     if(doc.storagePath){
       const {error}=await supabase.storage.from('rental-pilot-documents').remove([doc.storagePath]);
-      if(error) return alert(error.message);
+      if(error) alert('Document record removed, but file cleanup failed: '+error.message);
     }
     saveDocuments(documents.filter(d=>d.id!==id));
   };
@@ -1461,7 +1501,7 @@ function Payments({residents,properties,payments,month,onRecord,onDelete}){
 function Documents({documents,properties,residents,onAdd,onDelete,onOpen}){
   const [filter,setFilter]=useState('All');
   const shown=documents.filter(d=>filter==='All'||d.category===filter);
-  const categories=['All','Lease','Receipt','Proposal / Estimate','Invoice','Inspection','Insurance','HOA','Photo','Other'];
+  const categories=['All',...new Set(['Lease','Receipt','Proposal / Estimate','Invoice','Inspection','Insurance','HOA','Photo','Other',...documents.map(d=>d.category).filter(Boolean)])];
   return <>
     <section className="stats" style={{marginBottom:16}}>
       <Stat label="Documents" value={documents.length} sub="Saved document records"/>
@@ -1740,7 +1780,7 @@ function DocumentModal({properties,residents,onClose,onSave}){
     finally{setSaving(false);}
   };
   return <div className="modal-backdrop" onMouseDown={onClose}><div className="modal" onMouseDown={e=>e.stopPropagation()}>
-    <div className="modal-head"><div><h2>Add Document</h2><p>Organize it now; private cloud storage connects next.</p></div><button className="icon-button" onClick={onClose}><X/></button></div>
+    <div className="modal-head"><div><h2>Add Document</h2><p>Upload a file to your private document vault.</p></div><button className="icon-button" onClick={onClose}><X/></button></div>
     <div className="form-grid">
       <label>Document name<input value={form.name} onChange={e=>set('name',e.target.value)} placeholder="Unit 140 - 2026 Lease"/></label>
       <label>Type<select value={form.category} onChange={e=>set('category',e.target.value)}>{categories.map(c=><option key={c}>{c}</option>)}</select></label>
