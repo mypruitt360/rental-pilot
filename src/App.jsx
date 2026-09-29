@@ -593,7 +593,7 @@ export default function App(){
     const occupied=Math.min(Number(property.occupied)||0,capacity);
     const currentRent=Number(property.currentRent)||0;
     const potentialRent=Number(property.potentialRent)||currentRent;
-    const updated={...existing,...property,capacity,occupied,currentRent,potentialRent,status:occupied>=capacity&&capacity>0?'Healthy':'Opportunity'};
+    const updated={...existing,...property,capacity,occupied,currentRent,potentialRent,status:existing?.status==='Sold'?'Sold':occupied>=capacity&&capacity>0?'Healthy':'Opportunity'};
     saveProperties(properties.map(p=>p.id===id?updated:p));
 
     if(session?.user?.id){
@@ -612,6 +612,13 @@ export default function App(){
         alert(`Property updated on this device, but cloud update failed: ${err.message||err}`);
       });
     }
+  };
+  const changePropertyStatus = async (property,status) => {
+    if(!session?.user?.id || !property?.cloudId) throw new Error('Property is still syncing. Please try again.');
+    const {error}=await supabase.from('properties').update({status}).eq('id',property.cloudId).eq('owner_id',session.user.id);
+    if(error) throw error;
+    saveProperties(properties.map(p=>p.id===property.id?{...p,status}:p));
+    setSelectedPropertyId(null);
   };
   const addResident = resident => {
     const id=`resident-${Date.now()}`;
@@ -939,7 +946,14 @@ export default function App(){
     }
   };
 
-  const filtered = residents.filter(r=>r.name.toLowerCase().includes(query.toLowerCase()));
+  const activeProperties=properties.filter(p=>p.status!=='Sold');
+  const soldPropertyIds=new Set(properties.filter(p=>p.status==='Sold').map(p=>p.id));
+  const activeResidents=residents.filter(r=>!soldPropertyIds.has(r.propertyId));
+  const activeResidentIds=new Set(activeResidents.map(r=>r.id));
+  const activePayments=payments.filter(p=>activeResidentIds.has(p.residentId));
+  const activeExpenses=expenses.filter(e=>!soldPropertyIds.has(e.propertyId));
+  const activeMaintenance=maintenance.filter(m=>!soldPropertyIds.has(m.propertyId));
+  const filtered=activeResidents.filter(r=>r.name.toLowerCase().includes(query.toLowerCase()));
 
   if(!authReady) return <div style={{padding:40,fontFamily:'system-ui'}}>Loading Rental Pilot…</div>;
   if(!session) return <AuthGate/>;
@@ -958,8 +972,8 @@ export default function App(){
       {(section==='Command Center'||section==='Payments'||section==='Expenses'||section==='Reminders') &&
         <MonthPicker month={month} setMonth={setMonth}/>}
 
-      {section==='Command Center' && <CommandCenter properties={properties} residents={residents} payments={payments} expenses={expenses} maintenance={maintenance} month={month} onRecord={r=>setModal({type:'payment',residentId:r?.id})} onGo={setSection} onReviewLease={r=>setModal({type:'resident-edit',resident:r})}/>}
-      {section==='Residents' && <Residents properties={properties} query={query} setQuery={setQuery} residents={filtered} payments={payments} month={month} onRecord={r=>setModal({type:'payment',residentId:r.id})} onAdd={()=>setModal({type:'resident'})} onEdit={r=>setModal({type:'resident-edit',resident:r})} onDelete={removeResident}/>}
+      {section==='Command Center' && <CommandCenter properties={activeProperties} residents={activeResidents} payments={activePayments} expenses={activeExpenses} maintenance={activeMaintenance} month={month} onRecord={r=>setModal({type:'payment',residentId:r?.id})} onGo={setSection} onReviewLease={r=>setModal({type:'resident-edit',resident:r})}/>}
+      {section==='Residents' && <Residents properties={activeProperties} query={query} setQuery={setQuery} residents={filtered} payments={payments} month={month} onRecord={r=>setModal({type:'payment',residentId:r.id})} onAdd={()=>setModal({type:'resident'})} onEdit={r=>setModal({type:'resident-edit',resident:r})} onDelete={removeResident}/>}
       {section==='Properties' && (selectedPropertyId
         ? <PropertyDetail
             property={properties.find(p=>p.id===selectedPropertyId)}
@@ -972,7 +986,8 @@ export default function App(){
             onBack={()=>setSelectedPropertyId(null)}
             onRecord={r=>setModal({type:'payment',residentId:r.id})}
             onEdit={p=>setModal({type:'property-edit',property:p})}
-            onOpenDocument={openDocument}
+            onStatusChange={async (p,status)=>{try{await changePropertyStatus(p,status);}catch(err){alert('Could not update property: '+(err.message||err));}}}
+             onOpenDocument={openDocument}
           />
         : <Properties
             properties={properties}
@@ -986,19 +1001,19 @@ export default function App(){
       {section==='Expenses' && <Expenses expenses={expenses} properties={properties} month={month} onAdd={()=>setModal({type:'expense'})} onDelete={removeExpense}/>}
       {section==='Documents' && <Documents documents={documents} properties={properties} residents={residents} onAdd={()=>setModal({type:'document'})} onDelete={removeDocument} onOpen={openDocument}/>}
       {section==='Buy Box' && <BuyBox/>}
-      {section==='Reminders' && <Reminders residents={residents} properties={properties} payments={payments} month={month}/>}
+      {section==='Reminders' && <Reminders residents={activeResidents} properties={activeProperties} payments={activePayments} month={month}/>}
       {section==='Maintenance' && <Maintenance maintenance={maintenance} properties={properties} onAdd={()=>setModal({type:'maintenance'})} onStatus={updateMaintenance} onDelete={removeMaintenance}/>}
 
     </main>
 
     {modal?.type==='property' && <PropertyModal mode="add" onClose={()=>setModal(null)} onSave={p=>{addProperty(p);setModal(null);setSection('Properties');}}/>}
     {modal?.type==='property-edit' && <PropertyModal mode="edit" initial={modal.property} onClose={()=>setModal(null)} onSave={p=>{updateProperty(modal.property.id,p);setModal(null);}}/>}
-    {modal?.type==='resident' && <ResidentModal mode="add" properties={properties} onClose={()=>setModal(null)} onSave={r=>{addResident(r);setModal(null);setSection('Residents');}}/>}
+    {modal?.type==='resident' && <ResidentModal mode="add" properties={activeProperties} onClose={()=>setModal(null)} onSave={r=>{addResident(r);setModal(null);setSection('Residents');}}/>}
     {modal?.type==='resident-edit' && <ResidentModal mode="edit" initial={modal.resident} properties={properties} onClose={()=>setModal(null)} onSave={async r=>{await updateResident(modal.resident.id,r);setModal(null);setSection('Residents');}}/>}
-    {modal?.type==='payment' && <PaymentModal properties={properties} residents={residents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={async p=>{await upsertPayment(p);setModal(null);}}/>}
+    {modal?.type==='payment' && <PaymentModal properties={activeProperties} residents={activeResidents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={async p=>{await upsertPayment(p);setModal(null);}}/>}
     {modal?.type==='maintenance' && <MaintenanceModal properties={properties} onClose={()=>setModal(null)} onSave={m=>{addMaintenance(m); if(Number(m.actualCost)>0){addExpense({propertyId:m.propertyId,category:'Repairs & Maintenance',amount:Number(m.actualCost),date:m.datePaid||todayISO(),vendor:m.vendor||'',method:m.paymentMethod||'',notes:m.title});} setModal(null);}}/>}
-    {modal?.type==='expense' && <ExpenseModal properties={properties} onClose={()=>setModal(null)} onSave={e=>{addExpense(e);setModal(null);setSection('Expenses');}}/>}
-    {modal?.type==='document' && <DocumentModal properties={properties} residents={residents} onClose={()=>setModal(null)} onSave={async d=>{try{await addDocument(d);setModal(null);setSection('Documents');}catch(err){alert(err.message||'Upload failed');}}}/>}
+    {modal?.type==='expense' && <ExpenseModal properties={activeProperties} onClose={()=>setModal(null)} onSave={e=>{addExpense(e);setModal(null);setSection('Expenses');}}/>}
+    {modal?.type==='document' && <DocumentModal properties={activeProperties} residents={activeResidents} onClose={()=>setModal(null)} onSave={async d=>{try{await addDocument(d);setModal(null);setSection('Documents');}catch(err){alert(err.message||'Upload failed');}}}/>}
   </div>
 }
 
@@ -1306,9 +1321,12 @@ function Residents({properties,query,setQuery,residents:rs,payments,month,onReco
 }
 
 function Properties({properties,residents,payments,month,onAdd,onOpen}){
+  const [showSold,setShowSold]=useState(false);
+  const soldCount=properties.filter(p=>p.status==='Sold').length;
+  const visible=properties.filter(p=>showSold?p.status==='Sold':p.status!=='Sold');
   return <>
-    <div className="card-head"><div><h2>Your Properties</h2><p>Add properties as your portfolio grows.</p></div><button className="primary" onClick={onAdd}><Plus size={16}/> Add Property</button></div>
-    <section className="property-grid">{properties.map(p=>{
+    <div className="card-head"><div><h2>{showSold?'Sold Properties':'Your Properties'}</h2><p>{showSold?'Past properties and their records':'Active rental portfolio'}</p></div><div style={{display:'flex',gap:8}}>{soldCount>0&&<button className="secondary" onClick={()=>setShowSold(!showSold)}>{showSold?'Active properties':`Sold properties (${soldCount})`}</button>}<button className="primary" onClick={onAdd}><Plus size={16}/> Add Property</button></div></div>
+    <section className="property-grid">{visible.map(p=>{
       const rs=residents.filter(r=>r.propertyId===p.id);
       const collected=rs.reduce((s,r)=>s+paidForMonth(payments,r.id,month),0);
       const fixedMonthly=Number(p.hoaMonthly||0)+Number(p.internetMonthly||0)+Number(p.insuranceAnnual||0)/12+Number(p.taxesAnnual||0)/12;
@@ -1316,7 +1334,7 @@ function Properties({properties,residents,payments,month,onAdd,onOpen}){
       const capacity=Number(p.capacity||p.bedrooms||0);
       return <div className="property-card clickable" key={p.id} onClick={()=>onOpen?.(p)}>
         <div className="property-icon"><Building2/></div>
-        <span className={`badge ${rs.length>=capacity&&capacity>0?'occupied':'warning'}`}>{rs.length>=capacity&&capacity>0?'Healthy':'Opportunity'}</span>
+        <span className={`badge ${p.status==='Sold'?'warning':rs.length>=capacity&&capacity>0?'occupied':'warning'}`}>{p.status==='Sold'?'Sold':rs.length>=capacity&&capacity>0?'Healthy':'Opportunity'}</span>
         <h2>{p.name}</h2>
         <p>{rs.length} of {capacity} rooms occupied · {p.bedrooms}BR/{p.bathrooms}BA · {Number(p.sqft||0).toLocaleString()} sq ft</p>
         <div className="property-metrics four"><div><span>Value</span><strong>{money(p.currentValue)}</strong></div><div><span>Current rent</span><strong>{money(p.currentRent)}</strong></div><div><span>Collected</span><strong>{money(collected)}</strong></div><div><span>Fixed costs</span><strong>{money(fixedMonthly)}/mo</strong></div></div>
@@ -1327,7 +1345,7 @@ function Properties({properties,residents,payments,month,onAdd,onOpen}){
 }
 
 
-function PropertyDetail({property,residents,payments,expenses,maintenance,documents,month,onBack,onRecord,onEdit,onOpenDocument}){
+function PropertyDetail({property,residents,payments,expenses,maintenance,documents,month,onBack,onRecord,onEdit,onStatusChange,onOpenDocument}){
   if(!property) return <div className="card"><button className="secondary" onClick={onBack}>← Back to Properties</button><p>Property not found.</p></div>;
   const rs=residents.filter(r=>r.propertyId===property.id);
   const propertyResidentIds=new Set(rs.map(r=>r.id));
@@ -1399,7 +1417,11 @@ function PropertyDetail({property,residents,payments,expenses,maintenance,docume
         <h2 style={{marginTop:10}}>{property.name}</h2>
         <p>{property.shortName||''} · {property.bedrooms}BR/{property.bathrooms}BA · {Number(property.sqft||0).toLocaleString()} sq ft</p>
       </div>
-      <button className="primary" onClick={()=>onEdit(property)}>Edit Property</button>
+      <div style={{display:'flex',gap:8}}><button className="secondary" onClick={()=>{
+          const sold=property.status!=='Sold';
+          if(sold&&!window.confirm(`Mark ${property.name} as sold? It will leave your active portfolio while its records stay available.`)) return;
+          onStatusChange(property,sold?'Sold':'Opportunity');
+        }}>{property.status==='Sold'?'Restore to active':'Mark as sold'}</button><button className="primary" onClick={()=>onEdit(property)}>Edit Property</button></div>
     </div>
 
     <section className="stats" style={{marginBottom:16}}>
