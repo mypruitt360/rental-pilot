@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import {properties as seedProperties, residents as seedResidents, payers, seedPayments} from './data';
 import { supabase } from './lib/supabase';
+import { recurringBills, scheduledCategoryCost } from './lib/recurringExpenses';
 
 const money = n => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(Number(n)||0);
 const pct = n => `${(Number(n)||0).toFixed(1)}%`;
@@ -210,7 +211,9 @@ function expenseToDb(e,userId,propertyCloudId){
     category:e.category||'Other',
     vendor:e.vendor||'',
     incurred_on:e.date||e.incurredOn||todayISO(),
-    notes:e.notes||''
+    notes:e.notes||'',
+    recurring_id:e.recurringId||null,
+    recurring_month:e.recurringMonth||null
   };
 }
 
@@ -225,7 +228,9 @@ function expenseFromDb(r,properties,localExisting=null){
     category:r.category||'Other',
     vendor:r.vendor||'',
     date:r.incurred_on||todayISO(),
-    notes:r.notes||''
+    notes:r.notes||'',
+    recurringId:r.recurring_id||null,
+    recurringMonth:r.recurring_month||null
   };
 }
 
@@ -274,6 +279,9 @@ export default function App(){
   const [residents,setResidents]=useState(loadResidents);
   const [maintenance,setMaintenance]=useState(loadMaintenance);
   const [expenses,setExpenses]=useState(loadExpenses);
+  const [recurring,setRecurring]=useState([]);
+  const [recurringError,setRecurringError]=useState('');
+  const [recurringBusy,setRecurringBusy]=useState(false);
   const [documents,setDocuments]=useState(loadDocuments);
   const [query,setQuery]=useState('');
   const [modal,setModal]=useState(null);
@@ -558,6 +566,51 @@ export default function App(){
 
     return ()=>{cancelled=true;};
   },[session?.user?.id,properties]);
+
+  useEffect(()=>{
+    if(!session?.user?.id) { setRecurring([]); return; }
+    let cancelled=false;
+    readWithClockRetry(()=>supabase.from('recurring_expenses').select('*').order('category'))
+      .then(({data,error})=>{
+        if(error) throw error;
+        if(!cancelled){
+          setRecurring((data||[]).map(s=>({...s,propertyId:properties.find(p=>p.cloudId===s.property_id||p.id===s.property_id)?.id||s.property_id})));
+          setRecurringError('');
+        }
+      }).catch(err=>{if(!cancelled) setRecurringError(err.message||String(err));});
+    return ()=>{cancelled=true;};
+  },[session?.user?.id,properties]);
+
+  const saveRecurring=async form=>{
+    const property=properties.find(p=>p.id===form.propertyId);
+    if(!session?.user?.id||!property?.cloudId) throw new Error('Please wait for this property to connect to the cloud.');
+    const payload={owner_id:session.user.id,property_id:property.cloudId,category:form.category,
+      amount:form.amount===''?null:Number(form.amount),due_day:form.dueDay===''?null:Number(form.dueDay),
+      start_on:form.startOn,vendor:form.vendor||'',active:form.active};
+    const request=form.id?supabase.from('recurring_expenses').update(payload).eq('id',form.id):supabase.from('recurring_expenses').insert(payload);
+    const {data,error}=await request.select().single();
+    if(error) throw error;
+    setRecurring(prev=>[{...data,propertyId:property.id},...prev.filter(s=>s.id!==data.id)]);
+  };
+
+  const payRecurring=async bill=>{
+    if(recurringBusy||bill.pending||bill.payment) return;
+    const property=properties.find(p=>p.id===bill.propertyId);
+    const paidOn=window.prompt('Payment date (YYYY-MM-DD)',todayISO());
+    if(paidOn===null) return;
+    const parsedDate=new Date(`${paidOn}T12:00:00`);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(paidOn)||Number.isNaN(parsedDate.getTime())||parsedDate.toISOString().slice(0,10)!==paidOn){alert('Please enter a valid payment date.');return;}
+    setRecurringBusy(true);
+    try{
+      const record={propertyId:bill.propertyId,category:bill.category,amount:bill.amount,date:paidOn,
+        vendor:bill.vendor,notes:`Recurring ${bill.category} for ${monthLabel(month)}`,
+        recurringId:bill.id,recurringMonth:`${month}-01`};
+      const {data,error}=await supabase.from('expenses').insert(expenseToDb(record,session.user.id,property.cloudId)).select().single();
+      if(error) throw error;
+      setExpenses(prev=>{const next=[expenseFromDb(data,properties),...prev];localStorage.setItem(EXPENSE_KEY,JSON.stringify(next));return next;});
+    }catch(err){alert('Payment could not be recorded: '+(err.message||err));}
+    finally{setRecurringBusy(false);}
+  };
 
   const saveExpenses = next => { setExpenses(next); localStorage.setItem(EXPENSE_KEY,JSON.stringify(next)); };
   const saveDocuments = next => { setDocuments(next); localStorage.setItem(DOCUMENT_KEY,JSON.stringify(next)); };
@@ -980,6 +1033,7 @@ export default function App(){
             residents={residents}
             payments={payments}
             expenses={expenses}
+            recurring={recurring}
             maintenance={maintenance}
             documents={documents}
             month={month}
@@ -998,7 +1052,7 @@ export default function App(){
             onOpen={p=>setSelectedPropertyId(p.id)}
           />)}
       {section==='Payments' && <Payments residents={residents} properties={properties} payments={payments} month={month} onRecord={()=>setModal({type:'payment'})} onDelete={removePayment}/>}
-      {section==='Expenses' && <Expenses expenses={expenses} properties={properties} month={month} onAdd={()=>setModal({type:'expense'})} onDelete={removeExpense}/>}
+      {section==='Expenses' && <Expenses expenses={activeExpenses} properties={activeProperties} recurring={recurring.filter(s=>!soldPropertyIds.has(s.propertyId))} recurringError={recurringError} busy={recurringBusy} month={month} onAdd={()=>setModal({type:'expense'})} onDelete={removeExpense} onRecurring={()=>setModal({type:'recurring-expense'})} onEditRecurring={schedule=>setModal({type:'recurring-expense',schedule})} onPayRecurring={payRecurring}/>}
       {section==='Documents' && <Documents documents={documents} properties={properties} residents={residents} onAdd={()=>setModal({type:'document'})} onDelete={removeDocument} onOpen={openDocument}/>}
       {section==='Buy Box' && <BuyBox/>}
       {section==='Reminders' && <Reminders residents={activeResidents} properties={activeProperties} payments={activePayments} month={month}/>}
@@ -1012,6 +1066,7 @@ export default function App(){
     {modal?.type==='resident-edit' && <ResidentModal mode="edit" initial={modal.resident} properties={properties} onClose={()=>setModal(null)} onSave={async r=>{await updateResident(modal.resident.id,r);setModal(null);setSection('Residents');}}/>}
     {modal?.type==='payment' && <PaymentModal properties={activeProperties} residents={activeResidents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={async p=>{await upsertPayment(p);setModal(null);}}/>}
     {modal?.type==='maintenance' && <MaintenanceModal properties={properties} onClose={()=>setModal(null)} onSave={m=>{addMaintenance(m); if(Number(m.actualCost)>0){addExpense({propertyId:m.propertyId,category:'Repairs & Maintenance',amount:Number(m.actualCost),date:m.datePaid||todayISO(),vendor:m.vendor||'',method:m.paymentMethod||'',notes:m.title});} setModal(null);}}/>}
+    {modal?.type==='recurring-expense' && <RecurringExpenseModal properties={activeProperties} initial={modal.schedule} onClose={()=>setModal(null)} onSave={async form=>{await saveRecurring(form);setModal(null);setSection('Expenses');}}/>}
     {modal?.type==='expense' && <ExpenseModal properties={activeProperties} onClose={()=>setModal(null)} onSave={e=>{addExpense(e);setModal(null);setSection('Expenses');}}/>}
     {modal?.type==='document' && <DocumentModal properties={activeProperties} residents={activeResidents} onClose={()=>setModal(null)} onSave={async d=>{try{await addDocument(d);setModal(null);setSection('Documents');}catch(err){alert(err.message||'Upload failed');}}}/>}
   </div>
@@ -1345,7 +1400,7 @@ function Properties({properties,residents,payments,month,onAdd,onOpen}){
 }
 
 
-function PropertyDetail({property,residents,payments,expenses,maintenance,documents,month,onBack,onRecord,onEdit,onStatusChange,onOpenDocument}){
+function PropertyDetail({property,residents,payments,expenses,recurring=[],maintenance,documents,month,onBack,onRecord,onEdit,onStatusChange,onOpenDocument}){
   if(!property) return <div className="card"><button className="secondary" onClick={onBack}>← Back to Properties</button><p>Property not found.</p></div>;
   const rs=residents.filter(r=>r.propertyId===property.id);
   const propertyResidentIds=new Set(rs.map(r=>r.id));
@@ -1379,14 +1434,20 @@ function PropertyDetail({property,residents,payments,expenses,maintenance,docume
   const docs=documents.filter(d=>d.propertyId===property.id);
   const capacity=Number(property.capacity||property.bedrooms||0);
 
+  const hoaCost=scheduledCategoryCost(recurring,property.id,'HOA',month,property.hoaMonthly);
+  const internetCost=scheduledCategoryCost(recurring,property.id,'Internet',month,property.internetMonthly);
+  const pendingHOA=recurring.some(s=>s.propertyId===property.id&&s.category==='HOA'&&s.active&&s.amount==null);
   const fixedMonthly=
-    Number(property.hoaMonthly||0)+
-    Number(property.internetMonthly||0)+
+    hoaCost+
+    internetCost+
     Number(property.insuranceAnnual||0)/12+
     Number(property.taxesAnnual||0)/12;
 
   const fixedAnnual=fixedMonthly*12;
-  const ytdFixedCosts=fixedMonthly*selectedMonthNumber;
+  const ytdFixedCosts=Array.from({length:selectedMonthNumber},(_,i)=>{
+    const m=`${year}-${pad(i+1)}`;
+    return scheduledCategoryCost(recurring,property.id,'HOA',m,property.hoaMonthly)+scheduledCategoryCost(recurring,property.id,'Internet',m,property.internetMonthly)+Number(property.insuranceAnnual||0)/12+Number(property.taxesAnnual||0)/12;
+  }).reduce((total,cost)=>total+cost,0);
 
   const currentRent=Number(property.currentRent||0);
   const potentialRent=Number(property.potentialRent||0);
@@ -1442,12 +1503,12 @@ function PropertyDetail({property,residents,payments,expenses,maintenance,docume
       </div>
 
       <div className="card">
-        <div className="card-head"><div><h2>Cash Flow Breakdown</h2><p>Recurring costs separated from variable expenses</p></div></div>
+        <div className="card-head"><div><h2>Cash Flow Breakdown</h2><p>{pendingHOA?'HOA amount pending. Cash flow estimates exclude unconfirmed HOA dues.':'Recurring costs separated from variable expenses'}</p></div></div>
         <div className="result-grid">
           <Result label="Current rent" value={`${money(currentRent)}/mo`}/>
           <Result label="Potential rent" value={`${money(potentialRent)}/mo`}/>
-          <Result label="HOA" value={`${money(property.hoaMonthly||0)}/mo`}/>
-          <Result label="Internet" value={`${money(property.internetMonthly||0)}/mo`}/>
+          <Result label="HOA" value={pendingHOA?'Amount pending':`${money(hoaCost)}/mo`}/>
+          <Result label="Internet" value={`${money(internetCost)}/mo`}/>
           <Result label="Insurance" value={`${money(Number(property.insuranceAnnual||0)/12)}/mo`}/>
           <Result label="Property tax" value={`${money(Number(property.taxesAnnual||0)/12)}/mo`}/>
           <Result label="Recurring fixed costs" value={`${money(fixedMonthly)}/mo`}/>
@@ -1530,7 +1591,9 @@ function Documents({documents,properties,residents,onAdd,onDelete,onOpen}){
   </>
 }
 
-function Expenses({expenses,properties,month,onAdd,onDelete}){
+function Expenses({expenses,properties,recurring,recurringError,busy,month,onAdd,onDelete,onRecurring,onEditRecurring,onPayRecurring}){
+  const bills=recurringBills(recurring,expenses,month);
+  const unpaid=bills.filter(b=>!b.payment&&!b.pending).reduce((sum,b)=>sum+Number(b.amount),0);
   const monthItems=[...expenses].filter(e=>(e.date||'').startsWith(month)).sort((a,b)=>(b.date||'').localeCompare(a.date||''));
   const monthTotal=monthItems.reduce((s,e)=>s+Number(e.amount||0),0);
   const year=month.split('-')[0];
@@ -1544,6 +1607,21 @@ function Expenses({expenses,properties,month,onAdd,onDelete}){
       <Stat label="Transactions" value={monthItems.length} sub={`${monthLabel(month)} entries`}/>
       <Stat label="Largest category" value={Object.keys(categories).length?Object.entries(categories).sort((a,b)=>b[1]-a[1])[0][0]:'—'} sub={Object.keys(categories).length?money(Object.entries(categories).sort((a,b)=>b[1]-a[1])[0][1]):'No expenses yet'}/>
     </section>
+    <div className="card" style={{marginBottom:16}}>
+      <div className="card-head"><div><h2>Recurring Monthly Bills</h2><p>{monthLabel(month)} · {money(unpaid)} unpaid. Bills count as paid expenses only after you record payment.</p></div><button className="primary" onClick={onRecurring}><Plus size={16}/> Add Recurring Bill</button></div>
+      {recurringError&&<p role="alert">Recurring bills could not load: {recurringError}</p>}
+      <div className="ledger">
+        <div className="ledger-row ledger-head"><span>Due</span><span>Property</span><span>Bill</span><span>Amount</span><span>Actions</span></div>
+        {bills.map(b=><div className="ledger-row" key={b.id}>
+          <span>{b.date||'Date pending'}<small>{b.payment?'Paid':b.pending?'Needs details':b.date<todayISO()?'Overdue':'Upcoming'}</small></span>
+          <strong>{properties.find(p=>p.id===b.propertyId)?.shortName||'Property'}</strong>
+          <span>{b.category}<small>{b.vendor}</small></span>
+          <strong>{b.amount==null?'Amount pending':money(b.amount)}</strong>
+          <span><button className="secondary" onClick={()=>onEditRecurring(b)}>Edit</button>{!b.pending&&!b.payment&&<button className="secondary" disabled={busy} onClick={()=>onPayRecurring(b)}>Record paid</button>}</span>
+        </div>)}
+        {!bills.length&&!recurringError&&<Empty title="No recurring bills this month" text="Add a monthly bill once to track it automatically each month."/>}
+      </div>
+    </div>
     <div className="card">
       <div className="card-head"><div><h2>Expense Ledger</h2><p>Every dollar out, tied to a property.</p></div><button className="primary" onClick={onAdd}><Plus size={16}/> Add Expense</button></div>
       <div className="ledger">
@@ -1798,6 +1876,34 @@ function DocumentModal({properties,residents,onClose,onSave}){
     </div>
     <label>Notes<textarea value={form.notes} onChange={e=>set('notes',e.target.value)} rows="3"/></label>
     <button className="primary wide save" disabled={saving} onClick={save}><Save size={17}/> {saving?'Uploading…':'Upload & Save Document'}</button>
+  </div></div>
+}
+
+function RecurringExpenseModal({properties,initial,onClose,onSave}){
+  const [form,setForm]=useState(()=>({id:initial?.id,propertyId:initial?.propertyId||properties[0]?.id||'',category:initial?.category||'Internet',amount:initial?.amount??'',dueDay:initial?.due_day??'',startOn:initial?.start_on||todayISO(),vendor:initial?.vendor||'',active:initial?.active??true}));
+  const [saving,setSaving]=useState(false);
+  const [error,setError]=useState('');
+  const set=(key,value)=>setForm(prev=>({...prev,[key]:value}));
+  const save=async()=>{
+    if(!form.propertyId||!form.category.trim()||!form.startOn){setError('Choose a property, category and start date.');return;}
+    if(form.amount!==''&&(!Number.isFinite(Number(form.amount))||Number(form.amount)<=0)){setError('Enter a positive amount, or leave it blank if unknown.');return;}
+    if(form.dueDay!==''&&(!Number.isInteger(Number(form.dueDay))||Number(form.dueDay)<1||Number(form.dueDay)>31)){setError('Enter a due day from 1 to 31, or leave it blank if unknown.');return;}
+    setSaving(true);setError('');
+    try{await onSave(form);}catch(err){setError(err.message||String(err));setSaving(false);}
+  };
+  return <div className="modal-backdrop" onMouseDown={onClose}><div className="modal" onMouseDown={e=>e.stopPropagation()}>
+    <div className="modal-head"><div><h2>{initial?'Edit':'Add'} Recurring Bill</h2><p>Repeats monthly. Leave unknown amounts or due days blank until confirmed.</p></div><button className="icon-button" onClick={onClose}><X/></button></div>
+    <div className="form-grid">
+      <label>Property<select disabled={!!initial} value={form.propertyId} onChange={e=>set('propertyId',e.target.value)}>{properties.map(p=><option key={p.id} value={p.id}>{p.shortName||p.name}</option>)}</select></label>
+      <label>Category<select disabled={!!initial} value={form.category} onChange={e=>set('category',e.target.value)}>{['Internet','HOA','Insurance','Property Tax','Utilities','Management','Other'].map(c=><option key={c}>{c}</option>)}</select></label>
+      <label>Monthly amount<input type="number" min="0.01" step="0.01" placeholder="Amount pending" value={form.amount} onChange={e=>set('amount',e.target.value)}/></label>
+      <label>Due day of month<input type="number" min="1" max="31" placeholder="Date pending" value={form.dueDay} onChange={e=>set('dueDay',e.target.value)}/></label>
+      <label>Start date<input type="date" value={form.startOn} onChange={e=>set('startOn',e.target.value)}/></label>
+      <label>Vendor / payee<input value={form.vendor} onChange={e=>set('vendor',e.target.value)}/></label>
+      <label>Schedule<select value={form.active?'active':'paused'} onChange={e=>set('active',e.target.value==='active')}><option value="active">Active</option><option value="paused">Paused</option></select></label>
+    </div>
+    {error&&<p role="alert">{error}</p>}
+    <button className="primary wide save" disabled={saving} onClick={save}><Save size={17}/>{saving?'Saving…':'Save Recurring Bill'}</button>
   </div></div>
 }
 
