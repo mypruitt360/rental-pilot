@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {
   Building2, Users, WalletCards, BellRing, Wrench, Gauge, Search, Plus,
   CheckCircle2, Clock3, Target, TrendingUp, X, Save, ArrowRight, Sparkles, Receipt, FolderOpen, Upload, FileText
@@ -193,7 +193,7 @@ function paymentFromDb(r,residents,localExisting=null){
     ...(localExisting||{}),
     id:localExisting?.id||r.id,
     cloudId:r.id,
-    residentId:resident?.id||localExisting?.residentId||'',
+    residentId:resident?.id||localExisting?.residentId||r.resident_id,
     amount:Number(r.amount)||0,
     date:paidOn,
     method:r.method||'Other',
@@ -275,6 +275,7 @@ export default function App(){
   const [session,setSession]=useState(null);
   const [authReady,setAuthReady]=useState(false);
   const [payments,setPayments]=useState(loadPayments);
+  const paymentRevision=useRef(0);
   const [properties,setProperties]=useState(loadProperties);
   const [residents,setResidents]=useState(loadResidents);
   const [maintenance,setMaintenance]=useState(loadMaintenance);
@@ -459,8 +460,10 @@ export default function App(){
     let cancelled=false;
 
     const syncPayments=async()=>{
+      const revision=paymentRevision.current;
       const {data:rows,error}=await readWithClockRetry(()=>supabase.from('payments').select('*').order('paid_on',{ascending:true}));
       if(error) throw error;
+      if(cancelled||revision!==paymentRevision.current) return;
 
       // Once signed in, Supabase is the source of truth.
       // An empty cloud table means there are no payments.
@@ -482,7 +485,11 @@ export default function App(){
     return ()=>{cancelled=true;};
   },[session?.user?.id,residents]);
 
-  const savePayments = next => { setPayments(next); localStorage.setItem(PAYMENT_KEY,JSON.stringify(next)); };
+  const savePayments = next => { setPayments(previous=>{
+    const resolved=typeof next==='function'?next(previous):next;
+    try{localStorage.setItem(PAYMENT_KEY,JSON.stringify(resolved));}catch(err){console.warn('Payment cache unavailable:',err);}
+    return resolved;
+  }); };
   const saveProperties = next => { setProperties(next); localStorage.setItem(PROPERTY_KEY,JSON.stringify(next)); };
   const saveResidents = next => { setResidents(next); localStorage.setItem(RESIDENT_KEY,JSON.stringify(next)); };
   useEffect(()=>{
@@ -979,13 +986,17 @@ export default function App(){
       .insert(paymentToDb(payment,session.user.id,resident.cloudId))
       .select().single();
     if(error) throw error;
-    savePayments([...payments,paymentFromDb(data,residents)]);
+    const saved=paymentFromDb(data,residents);
+    paymentRevision.current+=1;
+    savePayments(previous=>[...previous.filter(p=>p.id!==saved.id),saved]);
+    setMonth(saved.month);
     setPaymentNotice(`${payment.paymentType==='Security deposit'?'Security deposit':'Rent payment'} of ${money(payment.amount)} saved for ${resident.name}.`);
   };
 
   const removePayment = id => {
     const existing=payments.find(p=>p.id===id);
-    savePayments(payments.filter(p=>p.id!==id));
+    paymentRevision.current+=1;
+    savePayments(previous=>previous.filter(p=>p.id!==id));
 
     if(session?.user?.id && existing?.cloudId){
       supabase.from('payments')
@@ -1025,7 +1036,7 @@ export default function App(){
       </header>
 
       {paymentNotice&&<div role="status" style={{display:'flex',alignItems:'center',gap:10,padding:16,marginBottom:16,borderRadius:12,background:'#e8f7ee',color:'#166534'}}>
-        <CheckCircle2 size={20}/><strong>{paymentNotice}</strong><button className="text-button" style={{marginLeft:'auto'}} onClick={()=>setPaymentNotice('')} aria-label="Dismiss payment confirmation"><X size={16}/></button>
+        <CheckCircle2 size={20}/><strong>{paymentNotice}</strong><button className="text-button" onClick={()=>setSection('Payments')}>View payment</button><button className="text-button" style={{marginLeft:'auto'}} onClick={()=>setPaymentNotice('')} aria-label="Dismiss payment confirmation"><X size={16}/></button>
       </div>}
       {(section==='Command Center'||section==='Payments'||section==='Expenses'||section==='Reminders') &&
         <MonthPicker month={month} setMonth={setMonth}/>}
