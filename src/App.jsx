@@ -286,6 +286,7 @@ export default function App(){
   const [query,setQuery]=useState('');
   const [modal,setModal]=useState(null);
   const [month,setMonth]=useState(currentMonthKey());
+  const [paymentNotice,setPaymentNotice]=useState('');
 
   useEffect(()=>{
     supabase.auth.getSession().then(({data})=>{setSession(data.session);setAuthReady(true);});
@@ -979,6 +980,7 @@ export default function App(){
       .select().single();
     if(error) throw error;
     savePayments([...payments,paymentFromDb(data,residents)]);
+    setPaymentNotice(`${payment.paymentType==='Security deposit'?'Security deposit':'Rent payment'} of ${money(payment.amount)} saved for ${resident.name}.`);
   };
 
   const removePayment = id => {
@@ -1022,6 +1024,9 @@ export default function App(){
         <button className="primary" onClick={()=>setModal({type:'payment'})}><Plus size={18}/> Record payment</button>
       </header>
 
+      {paymentNotice&&<div role="status" style={{display:'flex',alignItems:'center',gap:10,padding:16,marginBottom:16,borderRadius:12,background:'#e8f7ee',color:'#166534'}}>
+        <CheckCircle2 size={20}/><strong>{paymentNotice}</strong><button className="text-button" style={{marginLeft:'auto'}} onClick={()=>setPaymentNotice('')} aria-label="Dismiss payment confirmation"><X size={16}/></button>
+      </div>}
       {(section==='Command Center'||section==='Payments'||section==='Expenses'||section==='Reminders') &&
         <MonthPicker month={month} setMonth={setMonth}/>}
 
@@ -1222,6 +1227,7 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
 
     <section className="stats">
       <Stat label="Residents paid" value={`${paidCount}/${rentResidents.length}`} sub={`${paidCount} paid in full`}/>
+      <Stat label="Security deposits received" value={money(payments.filter(p=>p.paymentType==='Security deposit').reduce((sum,p)=>sum+Number(p.amount||0),0))} sub="Recorded deposits across active residents"/>
       <Stat label="Residents due" value={dueResidents.length} sub={`${unpaidCount} unpaid · ${partialCount} partial`}/>
       <Stat label="Outstanding rent" value={money(outstanding)} sub={`${monthLabel(month)} balance`} tone={outstanding>0?'opportunity':''}/>
       <Stat label="Lease alerts" value={leaseAlerts.length} sub={urgentLeaseCount?`${urgentLeaseCount} due within 30 days`:'Next 90 days' } tone={leaseAlerts.length?'opportunity':''}/>
@@ -1332,6 +1338,16 @@ function CommandCenter({properties,residents,payments,expenses,maintenance,month
 }
 
 
+function depositReceived(payments,residentId){
+  return payments.filter(p=>p.residentId===residentId&&p.paymentType==='Security deposit').reduce((total,p)=>total+Number(p.amount||0),0);
+}
+function DepositStatus({payments,residentId}){
+  const amount=depositReceived(payments,residentId);
+  return <small style={{display:'flex',alignItems:'center',gap:5,padding:'6px 8px',borderRadius:7,background:amount>0?'#e8f7ee':'#f1f5f9',color:amount>0?'#166534':'#64748b',fontWeight:600}}>
+    {amount>0&&<CheckCircle2 size={14}/>}
+    {amount>0?`Deposit received · ${money(amount)}`:'No deposit recorded'}
+  </small>;
+}
 function RentTable({properties,residents:rs,payments,month,onRecord,onDelete}){
   return <div className="table">
     <div className="tr th"><span>Resident</span><span>Suite</span><span>Rent</span><span>Status</span></div>
@@ -1340,7 +1356,7 @@ function RentTable({properties,residents:rs,payments,month,onRecord,onDelete}){
       <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
       <span>{money(r.rent)}</span>
       <span style={{display:'flex',gap:8,alignItems:'center'}}>
-        <button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+        <span style={{display:'flex',flexDirection:'column',gap:6}}><button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button><DepositStatus payments={payments} residentId={r.id}/></span>
         {onDelete&&<button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>}
       </span>
     </div>})}
@@ -1365,7 +1381,7 @@ function Residents({properties,query,setQuery,residents:rs,payments,month,onReco
           <span>{properties.find(p=>p.id===r.propertyId)?.shortName||'Unassigned'}</span>
           <span>{money(r.rent)}</span>
           <span style={{display:'flex',gap:8,alignItems:'center'}}>
-            <button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button>
+            <span style={{display:'flex',flexDirection:'column',gap:6}}><button className={variable?'paid':expectedRentForMonth(r,month,properties)===0?'partial':balance===0?'paid':paid>0?'partial':'due'} onClick={e=>{e.stopPropagation();onRecord?.(r)}}>{variable?<TrendingUp size={15}/>:balance===0?<CheckCircle2 size={15}/>:<Clock3 size={15}/>} {variable?`${money(paid)} received`:r.leaseStart&&month<r.leaseStart.slice(0,7)?`Rent starts ${r.leaseStart}`:balance===0?'Paid':paid>0?`${money(balance)} left`:'Due'}</button><DepositStatus payments={payments} residentId={r.id}/></span>
             <button className="secondary" onClick={e=>{e.stopPropagation();onEdit?.(r)}}>Edit</button>
             <button className="icon-button" onClick={e=>{e.stopPropagation();onDelete(r.id)}}><X size={15}/></button>
           </span>
@@ -1744,7 +1760,7 @@ function PaymentModal({properties,residents,payments,month,initialResidentId,onC
       {variableIncome && <div className="empty" style={{padding:14,marginBottom:14}}><strong>Variable income property</strong><p>Enter whatever was actually received this month. There is no fixed amount due.</p></div>}
       {!variableIncome && expected>0 && remaining===0 && <div className="empty" style={{padding:14,marginBottom:14}}><strong>Paid in full for {monthLabel(month)}</strong><p>This resident has no remaining rent balance for the selected month.</p></div>}
     </>:<div className="empty" style={{padding:14,margin:'12px 0 16px'}}>
-      <strong>Security deposit</strong><p>Record the amount and actual date received. This will appear in Payments without reducing rent due.</p>
+      <strong>Security deposit</strong><DepositStatus payments={payments||[]} residentId={residentId}/><p>Record the amount and actual date received. This will appear in Payments without reducing rent due.</p>
     </div>}
 
     <label>Payment amount<input type="number" min="0" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)}/></label>
