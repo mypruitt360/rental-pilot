@@ -682,59 +682,32 @@ export default function App(){
     saveProperties(properties.map(p=>p.id===property.id?{...p,status}:p));
     setSelectedPropertyId(null);
   };
-  const addResident = resident => {
+  const addResident = async resident => {
+    if(!session?.user?.id) throw new Error('Please sign in before adding a resident.');
+    const property=properties.find(p=>p.id===resident.propertyId);
+    if(!property?.cloudId) throw new Error('Property is not connected to the database. Please reload and try again.');
     const id=`resident-${Date.now()}`;
     const next={...resident,id,rent:Number(resident.rent)||0,dueDay:Number(resident.dueDay)||1,active:true};
-    saveResidents([...residents,next]);
-
-    if(session?.user?.id){
-      const property=properties.find(p=>p.id===next.propertyId);
-      if(!property?.cloudId){
-        alert('Resident saved on this device, but the property is not cloud-connected yet.');
-        return;
+    const payer=payerForResident(next);
+    let billingContactId=null;
+    try{
+      if(payer.name || payer.email || payer.phone){
+        const {data:contact,error:contactError}=await supabase.from('billing_contacts')
+          .insert({owner_id:session.user.id,name:payer.name||next.name,relationship:'Parent / Payer',email:payer.email||'',phone:payer.phone||''})
+          .select().single();
+        if(contactError) throw contactError;
+        billingContactId=contact.id;
       }
-
-      (async()=>{
-        try{
-          const payer=payerForResident(next);
-          let billingContactId=null;
-
-          if(payer.name || payer.email || payer.phone){
-            const {data:contact,error:contactError}=await supabase
-              .from('billing_contacts')
-              .insert({
-                owner_id:session.user.id,
-                name:payer.name||next.name,
-                relationship:'Parent / Payer',
-                email:payer.email||'',
-                phone:payer.phone||''
-              })
-              .select()
-              .single();
-            if(contactError) throw contactError;
-            billingContactId=contact.id;
-          }
-
-          const {data:created,error:createError}=await supabase
-            .from('residents')
-            .insert(residentToDb(next,session.user.id,property.cloudId,billingContactId))
-            .select()
-            .single();
-          if(createError) throw createError;
-
-          saveResidents([...residents,{
-            ...next,
-            cloudId:created.id,
-            cloudBillingContactId:billingContactId,
-            payerName:payer.name||next.payerName||'',
-            payerEmail:payer.email||next.payerEmail||'',
-            payerPhone:payer.phone||next.payerPhone||''
-          }]);
-        }catch(err){
-          console.error('Resident cloud save failed:',err);
-          alert(`Resident saved on this device, but cloud save failed: ${err.message||err}`);
-        }
-      })();
+      const {data:created,error:createError}=await supabase.from('residents')
+        .insert(residentToDb(next,session.user.id,property.cloudId,billingContactId))
+        .select().single();
+      if(createError) throw createError;
+      const saved={...next,cloudId:created.id,cloudBillingContactId:billingContactId,
+        payerName:payer.name||next.payerName||'',payerEmail:payer.email||next.payerEmail||'',payerPhone:payer.phone||next.payerPhone||''};
+      saveResidents([...loadResidents().filter(r=>r.id!==id),saved]);
+    }catch(err){
+      console.error('Resident cloud save failed:',err);
+      throw new Error('Resident was not saved to the database: '+(err.message||err));
     }
   };
 
@@ -982,9 +955,36 @@ export default function App(){
   const upsertPayment = async payment => {
     if(!session?.user?.id) throw new Error('Please sign in first.');
     const resident=residents.find(r=>r.id===payment.residentId);
-    if(!resident?.cloudId) throw new Error('Resident is still syncing. Please try again shortly.');
+    if(!resident) throw new Error('Please choose a valid resident.');
+    // Recover browser-only residents created by the old asynchronous save flow.
+    // Check the cloud first so a retry cannot create a duplicate resident.
+    let cloudResidentId=resident.cloudId;
+    if(!cloudResidentId){
+      const property=properties.find(p=>p.id===resident.propertyId);
+      if(!property?.cloudId) throw new Error('Resident property is not saved in the database.');
+      const {data:matches,error:lookupError}=await supabase.from('residents')
+        .select('id').eq('owner_id',session.user.id).eq('property_id',property.cloudId).eq('name',resident.name).limit(2);
+      if(lookupError) throw lookupError;
+      if((matches||[]).length>1) throw new Error('Multiple resident records match this name. Please contact support before recording payment.');
+      if(matches?.length===1) cloudResidentId=matches[0].id;
+      else{
+        const payer=payerForResident(resident);
+        let billingContactId=null;
+        if(payer.name||payer.email||payer.phone){
+          const {data:contact,error:contactError}=await supabase.from('billing_contacts')
+            .insert({owner_id:session.user.id,name:payer.name||resident.name,relationship:'Parent / Payer',email:payer.email||'',phone:payer.phone||''}).select().single();
+          if(contactError) throw contactError;
+          billingContactId=contact.id;
+        }
+        const {data:created,error:createError}=await supabase.from('residents')
+          .insert(residentToDb(resident,session.user.id,property.cloudId,billingContactId)).select('id').single();
+        if(createError) throw new Error('Unable to sync resident: '+createError.message);
+        cloudResidentId=created.id;
+      }
+      saveResidents(loadResidents().map(r=>r.id===resident.id?{...r,cloudId:cloudResidentId}:r));
+    }
     const {data,error}=await supabase.from('payments')
-      .insert(paymentToDb(payment,session.user.id,resident.cloudId))
+      .insert(paymentToDb(payment,session.user.id,cloudResidentId))
       .select().single();
     if(error) throw error;
     const saved=paymentFromDb(data,residents);
@@ -1079,7 +1079,7 @@ export default function App(){
 
     {modal?.type==='property' && <PropertyModal mode="add" onClose={()=>setModal(null)} onSave={p=>{addProperty(p);setModal(null);setSection('Properties');}}/>}
     {modal?.type==='property-edit' && <PropertyModal mode="edit" initial={modal.property} onClose={()=>setModal(null)} onSave={p=>{updateProperty(modal.property.id,p);setModal(null);}}/>}
-    {modal?.type==='resident' && <ResidentModal mode="add" properties={activeProperties} onClose={()=>setModal(null)} onSave={r=>{addResident(r);setModal(null);setSection('Residents');}}/>}
+    {modal?.type==='resident' && <ResidentModal mode="add" properties={activeProperties} onClose={()=>setModal(null)} onSave={async r=>{await addResident(r);setModal(null);setSection('Residents');}}/>}
     {modal?.type==='resident-edit' && <ResidentModal mode="edit" initial={modal.resident} properties={properties} onClose={()=>setModal(null)} onSave={async r=>{await updateResident(modal.resident.id,r);setModal(null);setSection('Residents');}}/>}
     {modal?.type==='payment' && <PaymentModal properties={activeProperties} residents={activeResidents} payments={payments} month={month} initialResidentId={modal.residentId||''} onClose={()=>setModal(null)} onSave={async p=>{await upsertPayment(p);setModal(null);}}/>}
     {modal?.type==='maintenance' && <MaintenanceModal properties={activeProperties} onClose={()=>setModal(null)} onSave={m=>{addMaintenance(m); if(Number(m.actualCost)>0){addExpense({propertyId:m.propertyId,category:'Repairs & Maintenance',amount:Number(m.actualCost),date:m.datePaid||todayISO(),vendor:m.vendor||'',method:m.paymentMethod||'',notes:m.title});} setModal(null);}}/>}
@@ -1820,6 +1820,8 @@ function ResidentModal({mode='add',initial=null,properties,onClose,onSave}){
         rent:Number(form.rent)||0,
         dueDay:Number(form.dueDay)||1
       });
+    } catch(err) {
+      alert(err.message||String(err));
     } finally {
       setSaving(false);
     }
